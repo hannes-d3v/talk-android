@@ -8,10 +8,15 @@
 package com.nextcloud.talk.chat.data.io
 import android.util.Log
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.chat.ChatActivity
+import com.nextcloud.talk.chat.data.model.ChatMessage
+import com.nextcloud.talk.ui.PlaybackSpeed
+import com.nextcloud.talk.utils.preferences.AppPreferences
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
@@ -19,23 +24,38 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileNotFoundException
 import kotlin.math.ceil
 import kotlin.time.Duration.Companion.milliseconds
 
 /**
- * Abstraction over an [ExoPlayer] instance, used to play back a voice recording before it is sent. Audio messages
- * of the chat are played by [VoiceMessageMediaService] instead.
+ * Abstraction over the [MediaPlayer](https://developer.android.com/reference/android/media/MediaPlayer) class used
+ * to manage the MediaPlayer instance.
  */
-@Suppress("TooGenericExceptionCaught")
+@Suppress("TooManyFunctions", "TooGenericExceptionCaught")
 class MediaPlayerManager : LifecycleAwareManager {
     companion object {
         val TAG: String = MediaPlayerManager::class.java.simpleName
         private const val SEEKBAR_UPDATE_DELAY = 150L
+        private const val ONE_SEC = 1000
         private const val DIVIDER = 100f
+        private const val IS_PLAYED_CUTOFF = 5
+
+        @JvmStatic
+        private val manager: MediaPlayerManager = MediaPlayerManager()
+
+        fun sharedInstance(preferences: AppPreferences): MediaPlayerManager =
+            manager.apply {
+                appPreferences = preferences
+            }
     }
+
+    lateinit var appPreferences: AppPreferences
 
     enum class MediaPlayerManagerState {
         DEFAULT,
@@ -47,7 +67,19 @@ class MediaPlayerManager : LifecycleAwareManager {
         ERROR
     }
 
-    private val managerState = MutableStateFlow(MediaPlayerManagerState.DEFAULT)
+    val backgroundPlayUIFlow: StateFlow<ChatMessage?>
+        get() = _backgroundPlayUIFlow
+    private val _backgroundPlayUIFlow = MutableStateFlow<ChatMessage?>(null)
+
+    val managerState: Flow<MediaPlayerManagerState>
+        get() = _managerState
+    private val _managerState = MutableStateFlow(MediaPlayerManagerState.DEFAULT)
+
+    private val playQueue = mutableListOf<Pair<String, ChatMessage>>()
+
+    val mediaPlayerSeekBarPositionMsg: Flow<ChatMessage>
+        get() = _mediaPlayerSeekBarPositionMsg
+    private val _mediaPlayerSeekBarPositionMsg: MutableSharedFlow<ChatMessage> = MutableSharedFlow()
 
     val mediaPlayerSeekBarPosition: Flow<Int>
         get() = _mediaPlayerSeekBarPosition
@@ -57,8 +89,14 @@ class MediaPlayerManager : LifecycleAwareManager {
     private var loop = false
     private var scope = MainScope()
 
+    private val _currentCycledMessage = MutableStateFlow<ChatMessage?>(null)
+    val currentCycledMessage: StateFlow<ChatMessage?>
+        get() = _currentCycledMessage
+
+    private var currentDataSource: String = ""
     var mediaPlayerDuration: Int = 0
     var mediaPlayerPosition: Int = 0
+    private var requestedPlaybackSpeed: PlaybackSpeed? = null
 
     /**
      * Starts playing audio from the given path, initializes or resumes if the player is already created.
@@ -71,7 +109,28 @@ class MediaPlayerManager : LifecycleAwareManager {
         if (mediaPlayer == null || !scope.isActive) {
             init(path)
         } else {
-            managerState.value = MediaPlayerManagerState.RESUMED
+            _managerState.value = MediaPlayerManagerState.RESUMED
+            mediaPlayer!!.play()
+            loop = true
+            scope.launch { seekbarUpdateObserver() }
+        }
+    }
+
+    /**
+     * Starting cycling through the playQueue, playing messages automatically unless stop() is called.
+     *
+     */
+    fun startCycling() {
+        if (mediaPlayer != null && mediaPlayer!!.isPlaying) {
+            stop()
+        }
+
+        val shouldReset = playQueue.isNotEmpty() && playQueue.first().first != currentDataSource
+
+        if (mediaPlayer == null || !scope.isActive || shouldReset) {
+            initCycling()
+        } else {
+            _managerState.value = MediaPlayerManagerState.RESUMED
             mediaPlayer!!.play()
             loop = true
             scope.launch { seekbarUpdateObserver() }
@@ -89,19 +148,24 @@ class MediaPlayerManager : LifecycleAwareManager {
             mediaPlayer!!.stop()
             mediaPlayer!!.release()
             mediaPlayer = null
-            managerState.value = MediaPlayerManagerState.STOPPED
+            _currentCycledMessage.value = null
+            _backgroundPlayUIFlow.tryEmit(null)
+            _managerState.value = MediaPlayerManagerState.STOPPED
         }
     }
 
     /**
      * Pauses the player.
      */
-    fun pause() {
+    fun pause(notifyUI: Boolean) {
         if (mediaPlayer != null) {
             Log.d(TAG, "media player paused")
-            managerState.value = MediaPlayerManagerState.PAUSED
+            _managerState.value = MediaPlayerManagerState.PAUSED
             mediaPlayer!!.pause()
             loop = false
+            if (notifyUI) {
+                _backgroundPlayUIFlow.tryEmit(null)
+            }
         }
     }
 
@@ -117,6 +181,8 @@ class MediaPlayerManager : LifecycleAwareManager {
     }
 
     private suspend fun seekbarUpdateObserver() {
+        _currentCycledMessage.value?.voiceMessageDuration = mediaPlayerDuration / ONE_SEC
+        _currentCycledMessage.value?.resetVoiceMessage = false
         withContext(Dispatchers.IO) {
             while (true) {
                 if (!loop) {
@@ -137,7 +203,16 @@ class MediaPlayerManager : LifecycleAwareManager {
                         val pos = p.currentPosition
                         mediaPlayerPosition = pos.toInt()
                         val progress = (pos.toFloat() / mediaPlayerDuration) * DIVIDER
-                        _mediaPlayerSeekBarPosition.emit(ceil(progress).toInt())
+                        val progressI = ceil(progress).toInt()
+                        val seconds = (pos / ONE_SEC).toInt()
+                        _mediaPlayerSeekBarPosition.emit(progressI)
+                        _currentCycledMessage.value?.let { msg ->
+                            msg.isPlayingVoiceMessage = true
+                            msg.voiceMessageSeekbarProgress = progressI
+                            msg.voiceMessagePlayedSeconds = seconds
+                            if (progressI >= IS_PLAYED_CUTOFF) msg.wasPlayedVoiceMessage = true
+                            _mediaPlayerSeekBarPositionMsg.emit(msg)
+                        }
                     }
                 }
 
@@ -146,17 +221,50 @@ class MediaPlayerManager : LifecycleAwareManager {
         }
     }
 
+    /**
+     * Adds a audio file to the play queue. for cycling through
+     *
+     * @throws FileNotFoundException if the file is not downloaded to cache first
+     */
+    fun addToPlayList(path: String, chatMessage: ChatMessage) {
+        val file = File(path)
+        if (!file.exists()) {
+            throw FileNotFoundException("Cannot add to playlist without downloading to cache first for path\n$path")
+        }
+
+        for (pair in playQueue) {
+            if (pair.first == path) return
+        }
+
+        playQueue.add(Pair(path, chatMessage))
+    }
+
+    fun clearPlayList() {
+        playQueue.clear()
+    }
+
+    /**
+     * Sets the player speed.
+     */
+    fun setPlayBackSpeed(speed: PlaybackSpeed) {
+        requestedPlaybackSpeed = speed
+        if (mediaPlayer != null && mediaPlayer!!.isPlaying) {
+            mediaPlayer!!.playbackParameters = PlaybackParameters(speed.value)
+        }
+    }
+
     private fun init(path: String) {
         try {
             val context = NextcloudTalkApplication.sharedApplication!!.applicationContext
             mediaPlayer = ExoPlayer.Builder(context).build().apply {
-                managerState.value = MediaPlayerManagerState.SETUP
+                _managerState.value = MediaPlayerManagerState.SETUP
                 setMediaItem(MediaItem.fromUri(path))
+                currentDataSource = path
                 prepare()
                 addListener(object : Player.Listener {
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         if (playbackState == Player.STATE_READY &&
-                            managerState.value == MediaPlayerManagerState.SETUP
+                            _managerState.value == MediaPlayerManagerState.SETUP
                         ) {
                             onPrepare()
                         }
@@ -165,14 +273,83 @@ class MediaPlayerManager : LifecycleAwareManager {
             }
         } catch (e: Exception) {
             Log.e(ChatActivity.TAG, "failed to initialize mediaPlayer", e)
-            managerState.value = MediaPlayerManagerState.ERROR
+            _managerState.value = MediaPlayerManagerState.ERROR
+        }
+    }
+
+    private fun initCycling() {
+        try {
+            val context = NextcloudTalkApplication.sharedApplication!!.applicationContext
+            mediaPlayer = ExoPlayer.Builder(context).build().apply {
+                _managerState.value = MediaPlayerManagerState.SETUP
+                val pair = playQueue.iterator().next()
+                setMediaItem(MediaItem.fromUri(pair.first))
+                currentDataSource = pair.first
+                _currentCycledMessage.value = pair.second
+                playQueue.removeAt(0)
+                prepare()
+                addListener(object : Player.Listener {
+                    override fun onPlaybackStateChanged(playbackState: Int) {
+                        if (playbackState == Player.STATE_READY &&
+                            _managerState.value == MediaPlayerManagerState.SETUP
+                        ) {
+                            onPrepare()
+                        } else if (playbackState == Player.STATE_ENDED) {
+                            if (playQueue.iterator().hasNext() && playQueue.first().first != currentDataSource) {
+                                _managerState.value = MediaPlayerManagerState.SETUP
+                                val nextPair = playQueue.iterator().next()
+                                playQueue.removeAt(0)
+                                mediaPlayer?.setMediaItem(MediaItem.fromUri(nextPair.first))
+                                currentDataSource = nextPair.first
+                                _currentCycledMessage.value = nextPair.second
+                                prepare()
+                            } else {
+                                mediaPlayer?.release()
+                                mediaPlayer = null
+                                _backgroundPlayUIFlow.tryEmit(null)
+                                _currentCycledMessage.value?.let {
+                                    it.resetVoiceMessage = true
+                                    it.isPlayingVoiceMessage = false
+                                    it.voiceMessageSeekbarProgress = 0
+                                    it.voiceMessagePlayedSeconds = 0
+                                }
+                                val completedMessage = _currentCycledMessage.value
+                                _currentCycledMessage.value = null
+                                if (completedMessage != null) {
+                                    scope.launch {
+                                        _mediaPlayerSeekBarPositionMsg.emit(completedMessage)
+                                    }
+                                }
+                                loop = false
+                                _managerState.value = MediaPlayerManagerState.STOPPED
+                            }
+                        }
+                    }
+                })
+            }
+        } catch (e: Exception) {
+            Log.e(ChatActivity.TAG, "failed to initialize mediaPlayer", e)
+            _managerState.value = MediaPlayerManagerState.ERROR
         }
     }
 
     private fun ExoPlayer.onPrepare() {
         mediaPlayerDuration = this.duration.toInt()
+
+        val playBackSpeed = requestedPlaybackSpeed?.value
+            ?: if (_currentCycledMessage.value?.actorId == null) {
+                PlaybackSpeed.NORMAL.value
+            } else {
+                appPreferences.getPreferredPlayback(_currentCycledMessage.value?.actorId).value
+            }
+        playbackParameters = PlaybackParameters(playBackSpeed)
+
         play()
-        managerState.value = MediaPlayerManagerState.STARTED
+        _managerState.value = MediaPlayerManagerState.STARTED
+        _currentCycledMessage.value?.let {
+            it.isPlayingVoiceMessage = true
+            _backgroundPlayUIFlow.tryEmit(it)
+        }
         loop = true
         scope = MainScope()
         scope.launch { seekbarUpdateObserver() }
@@ -190,5 +367,10 @@ class MediaPlayerManager : LifecycleAwareManager {
 
     override fun handleOnStop() {
         loop = false
+        if (mediaPlayer != null && _currentCycledMessage.value != null && mediaPlayer!!.isPlaying) {
+            CoroutineScope(Dispatchers.Default).launch {
+                _backgroundPlayUIFlow.tryEmit(_currentCycledMessage.value)
+            }
+        }
     }
 }

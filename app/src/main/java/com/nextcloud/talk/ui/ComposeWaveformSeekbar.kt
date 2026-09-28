@@ -33,7 +33,6 @@ const val MAX_HEIGHT = 100
 const val OVERLAP = 0.025
 const val PROGRESS = 0.97f
 
-@Suppress("LongParameterList")
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ComposeWaveformSeekBar(
@@ -41,9 +40,7 @@ fun ComposeWaveformSeekBar(
     onValueChange: (Float) -> Unit,
     modifier: Modifier,
     waveData: FloatArray,
-    enabled: Boolean,
-    onValueChangeFinished: () -> Unit = {},
-    sliderModifier: Modifier = Modifier
+    enabled: Boolean
 ) {
     val barWidth = Stroke.DefaultMiter
     val thumbSize = WAVEFORM_THUMB_SIZE.dp
@@ -54,8 +51,6 @@ fun ComposeWaveformSeekBar(
         value = value,
         enabled = enabled,
         onValueChange = onValueChange,
-        onValueChangeFinished = onValueChangeFinished,
-        modifier = sliderModifier,
         track = {
             Box(
                 modifier = modifier
