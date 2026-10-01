@@ -30,7 +30,9 @@ import androidx.core.content.pm.ShortcutInfoCompat
 import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.core.graphics.drawable.IconCompat
 import androidx.core.net.toUri
+import androidx.compose.runtime.getValue
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.work.Data
 import androidx.work.OneTimeWorkRequest
@@ -50,6 +52,11 @@ import com.nextcloud.talk.activities.MainActivity
 import com.nextcloud.talk.api.NcApiCoroutines
 import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.chat.ChatActivity
+import com.nextcloud.talk.chat.audio.ChatAudioKey
+import com.nextcloud.talk.chat.audio.ChatAudioPlayer
+import com.nextcloud.talk.chat.audio.ChatAudioSpeeds
+import com.nextcloud.talk.chat.audio.ChatAudioStore
+import com.nextcloud.talk.chat.audio.openMessageIntent
 import com.nextcloud.talk.contacts.ContactsActivity
 import com.nextcloud.talk.contacts.ContactsViewModel
 import com.nextcloud.talk.conversation.RenameConversationDialogFragment
@@ -74,6 +81,8 @@ import com.nextcloud.talk.models.domain.SearchMessageEntry
 import com.nextcloud.talk.models.json.conversations.ConversationEnums
 import com.nextcloud.talk.settings.SettingsActivity
 import com.nextcloud.talk.threadsoverview.ThreadsOverviewActivity
+import com.nextcloud.talk.ui.chat.ChatAudioPlayerHost
+import com.nextcloud.talk.ui.chat.chatAudioPlayerCallbacks
 import com.nextcloud.talk.ui.chooseaccount.ChooseAccountShareToDialogFragment
 import com.nextcloud.talk.ui.dialog.FilterConversationFragment
 import com.nextcloud.talk.ui.dialog.FilterConversationFragment.Companion.ARCHIVE
@@ -148,6 +157,14 @@ class ConversationsListActivity : BaseActivity() {
     @Inject
     lateinit var contactsViewModel: ContactsViewModel
 
+    @Inject
+    lateinit var chatAudioStore: ChatAudioStore
+
+    @Inject
+    lateinit var chatAudioSpeeds: ChatAudioSpeeds
+
+    private lateinit var chatAudioPlayer: ChatAudioPlayer
+
     lateinit var conversationsListViewModel: ConversationsListViewModel
 
     lateinit var conversationTagsViewModel: ConversationTagsViewModel
@@ -197,6 +214,8 @@ class ConversationsListActivity : BaseActivity() {
         super.onCreate(savedInstanceState)
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
         ecosystemManager = EcosystemManager(this@ConversationsListActivity)
+        chatAudioPlayer = ChatAudioPlayer(this, chatAudioStore)
+        lifecycle.addObserver(chatAudioPlayer)
 
         val targetUserId = intent.getLongExtra(KEY_INTERNAL_USER_ID, 0L)
         currentUser = if (targetUserId != 0L) {
@@ -215,12 +234,22 @@ class ConversationsListActivity : BaseActivity() {
         }
         onBackPressedDispatcher.addCallback(this, onBackPressedCallback)
 
+        val audioPlayerCallbacks = chatAudioPlayerCallbacks(
+            player = chatAudioPlayer,
+            speeds = chatAudioSpeeds,
+            scope = lifecycleScope,
+            onOpenMessage = { openAudioMessage(it) }
+        )
         setContent {
             ConversationsListScreen(
                 viewModel = conversationsListViewModel,
                 tagsViewModel = conversationTagsViewModel,
                 state = buildScreenState(),
-                callbacks = buildScreenCallbacks()
+                callbacks = buildScreenCallbacks(),
+                audioPlayer = {
+                    val audioState by chatAudioPlayer.state.collectAsStateWithLifecycle()
+                    ChatAudioPlayerHost(state = audioState, callbacks = audioPlayerCallbacks)
+                }
             )
         }
 
@@ -653,6 +682,19 @@ class ConversationsListActivity : BaseActivity() {
             threadId?.let { putExtra(BundleKeys.KEY_THREAD_ID, it) }
         }
         startActivity(intent)
+    }
+
+    /** Opens the chat of an audio message at the message; messages of another account switch to that account. */
+    private fun openAudioMessage(key: ChatAudioKey) {
+        if (key.internalUserId == currentUser?.id) {
+            val intent = Intent(context, ChatActivity::class.java).apply {
+                putExtra(KEY_ROOM_TOKEN, key.roomToken)
+                putExtra(BundleKeys.KEY_MESSAGE_ID, key.messageId.toString())
+            }
+            startActivity(intent)
+        } else {
+            startActivity(key.openMessageIntent(this))
+        }
     }
 
     fun filterConversation() {
